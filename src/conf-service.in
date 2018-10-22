@@ -1,0 +1,220 @@
+#!@GUILE@
+!#
+; vim: set filetype=scheme:
+
+(use-modules 
+  (rnrs bytevectors)
+  (ice-9 getopt-long)
+  (databuf)
+  (sqlite3))
+
+(define *debug-flag* #f)
+
+(define *message-add-key* #x01)
+(define *message-del-key* #x02)
+(define *message-get-val* #x03)
+(define *message-set-val* #x04)
+(define *message-err* #x05)
+
+(define *value-type-u8* #x01)
+(define *value-type-s8* #x02)
+(define *value-type-u16* #x03)
+(define *value-type-s16* #x04)
+(define *value-type-u32* #x05)
+(define *value-type-s32* #x06)
+(define *value-type-u64* #x07)
+(define *value-type-s64* #x08)
+(define *value-type-string* #x09)
+
+(define *error-key-not-exists* #x01)
+
+(define *min-read-sleep* 1953)
+(define *max-read-sleep* 1000000)
+
+(define* (print-debug #:rest params)
+  (if *debug-flag*
+    (apply simple-format (cons #t params))))
+
+(define (sqlite-exec db sql)
+  (let* ([lst '()]
+	 [stmt (sqlite-prepare db sql)]
+	 [proc (lambda (v)
+		 (set! lst (append lst (list v))))])
+    (print-debug "execute query ~A~%" sql)
+    (sqlite-map proc stmt)
+    (if (not (null? lst))
+      (print-debug "query result: ~A~%" lst))
+    lst))
+
+(define (open-db path)
+  (print-debug "open database ~A~%" path)
+  (let ([r (sqlite-open 
+	     path 
+	     (logior SQLITE_OPEN_CREATE SQLITE_OPEN_READWRITE))])
+    (sqlite-exec r "pragma foreign_keys = ON;")
+    (sqlite-exec r "CREATE TABLE IF NOT EXISTS types (id INTEGER PRIMARY KEY, descr TEXT NOT NULL)")
+    (sqlite-exec r "INSERT OR IGNORE INTO types (id,descr) VALUES('1','8 bit unsigned integer')")
+    (sqlite-exec r "INSERT OR IGNORE INTO types (id,descr) VALUES('2','8 bit signed integer')")
+    (sqlite-exec r "INSERT OR IGNORE INTO types (id,descr) VALUES('3','16 bit unsigned integer')")
+    (sqlite-exec r "INSERT OR IGNORE INTO types (id,descr) VALUES('4','16 bit signed integer')")
+    (sqlite-exec r "INSERT OR IGNORE INTO types (id,descr) VALUES('5','32 bit unsigned integer')")
+    (sqlite-exec r "INSERT OR IGNORE INTO types (id,descr) VALUES('6','32 bit signed integer')")
+    (sqlite-exec r "INSERT OR IGNORE INTO types (id,descr) VALUES('7','64 bit unsigned integer')")
+    (sqlite-exec r "INSERT OR IGNORE INTO types (id,descr) VALUES('8','64 bit signed integer')")
+    (sqlite-exec r "INSERT OR IGNORE INTO types (id,descr) VALUES('9','character string')")
+    (sqlite-exec r "CREATE TABLE IF NOT EXISTS keys (id TEXT PRIMARY KEY NOT NULL, type TEXT NOT NULL, FOREIGN KEY (type) REFERENCES types(id))")
+    (sqlite-exec r "CREATE TABLE IF NOT EXISTS vals (keys_id TEXT NOT NULL, value TEXT NOT NULL, FOREIGN KEY (keys_id) REFERENCES keys(id))")
+    r))
+
+(define (close-db db path)
+  (print-debug "close database ~A~%" path)
+  (sqlite-close db))
+
+(define (open-socket path)
+  (print-debug "open UNIX socket ~A~%" path)
+  (let ([sock (socket PF_UNIX SOCK_DGRAM 0)])
+    (bind sock AF_UNIX path)
+    sock))
+
+(define (close-socket sock path)
+  (print-debug "close UNIX socket ~A~%" path)
+  (shutdown sock 2)
+  (delete-file path))
+
+(define (send-error sock addr seq err)
+  (print-debug "send error response with seq: ~A, code: ~A~%" seq err)
+  (let ([dbuf (make-databuf DATABUF_ENDIANNESS_BIG)])
+    (databuf-write-u8! dbuf *message-err*) ; Message type
+    (databuf-write-u32! dbuf seq) ; Seq number
+    (databuf-write-u8! dbuf err) ; Error code
+    (sendto sock (databuf->bytevector dbuf) addr)))
+
+(define (handle-get-value db dbuf sock addr seq)
+  (let ([k (databuf-read-string dbuf)])
+    (print-debug "manage get-value for key ~A~%" k)
+    (let ([r (sqlite-exec 
+	       db
+	       (simple-format #f "SELECT keys.id,keys.type,vals.value FROM keys INNER JOIN vals ON vals.keys_id = keys.id WHERE keys.id='~A'" k))])
+      (if (null? r)
+	(send-error sock addr seq *error-key-not-exists*)
+	(let* ([v (list-ref r 0)]
+	       [id (vector-ref v 0)]
+	       [type (string->number (vector-ref v 1))]
+	       [value (vector-ref v 2)]
+	       [xdbuf (make-databuf DATABUF_ENDIANNESS_BIG)])
+	  (databuf-write-u32! xdbuf seq)
+	  (databuf-write-u8! xdbuf *message-get-val*)
+	  (cond
+	    ((= type *value-type-u8*)
+	     (databuf-write-u8! xdbuf (string->number value)))
+	    ((= type *value-type-s8*)
+	     (databuf-write-s8! xdbuf (string->number value)))
+	    ((= type *value-type-u16*)
+	     (databuf-write-u16! xdbuf (string->number value)))
+	    ((= type *value-type-s16*)
+	     (databuf-write-s16! xdbuf (string->number value)))
+	    ((= type *value-type-u32*)
+	     (databuf-write-u32! xdbuf (string->number value)))
+	    ((= type *value-type-s32*)
+	     (databuf-write-s32! xdbuf (string->number value)))
+	    ((= type *value-type-u8*)
+	     (databuf-write-u64! xdbuf (string->number value)))
+	    ((= type *value-type-s64*)
+	     (databuf-write-s64! xdbuf (string->number value)))
+	    ((= type *value-type-string*)
+	     (databuf-write-string! xdbuf value)))
+	  (let ([bv (databuf->bytevector xdbuf)])
+	    (print-debug "send back ~A~%" bv)
+	    (sendto sock bv addr)))))))
+
+(define (handle-message db bv sock addr)
+  (let* ([dbuf (bytevector->databuf bv DATABUF_ENDIANNESS_BIG)]
+	 [seq (databuf-read-u32 dbuf)]
+	 [type (databuf-read-u8 dbuf)])
+    (simple-format #t "message type: ~A~%" type)
+    (cond
+      ((= type *message-add-key*) (simple-format #t "add key request~%"))
+      ((= type *message-del-key*) (simple-format #t "del key request~%"))
+      ((= type *message-get-val*) 
+       (simple-format #t "get value request~%")
+       (handle-get-value db dbuf sock addr seq))
+      ((= type *message-set-val*) (simple-format #t "set value request~%"))
+      (else (simple-format #t "invalid request~%")))))
+
+(define (receive-message db sock)
+  (let ([bv (make-bytevector #x1000)]
+	[r #f]
+	[st *min-read-sleep*])
+    (while #t
+	   (catch 'system-error
+		  (lambda ()
+		    (set! r (recvfrom! sock bv MSG_DONTWAIT))
+		    (set! st *min-read-sleep*)
+		    (if r
+		      (let* ([cnt (car r)]
+			     [addr (cdr r)]
+			     [xbv (make-bytevector cnt)])
+			(bytevector-copy! bv 0 xbv 0 cnt)
+			(simple-format #t "received ~A bytes from ~A ~A~%" cnt addr xbv)
+			(handle-message db xbv sock addr))))
+		  (lambda data
+		    (let ([c (system-error-errno data)])
+		      (if (not (= c EAGAIN))
+			(throw 'system-error data)
+			(begin
+			  (print-debug "no data available on socket ~A, sleep ~A us~%" sock st)
+			  (usleep st)
+			  (set! st (min (* st 2) *max-read-sleep*))))))))))
+
+(define (display-help)
+  (simple-format #t "conf-service [options]~%")
+  (simple-format #t "  -h, --help              Display this help~%")
+  (simple-format #t "  -v, --version           Display version~%")
+  (simple-format #t "  -c FILE, --config FILE  Use FILE as configuration database~%"))
+
+(define (display-help-and-exit status)
+  (display-help)
+  (exit status))
+
+(define (display-version-and-exit)
+  (simple-format #t "conf-service version @VERSION@")
+  (exit EXIT_SUCCESS))
+
+(let* ([opt-spec '((help (single-char #\h) (value #f))
+		   (version (single-char #\v) (value #f))
+		   (config (single-char #\c) (value #t))
+		   (socket (single-char #\s) (value #t))
+		   (debug (single-char #\d) (value #f)))]
+       [options (getopt-long (command-line) opt-spec)]
+       [done #f]
+       [do-exit 
+	 (lambda (n)
+	   (print-debug "received signal ~A, exit~%" n)
+	   (set! done #t)
+	   (exit EXIT_FAILURE))])
+  (sigaction SIGTERM do-exit)
+  (sigaction SIGINT do-exit)
+  (set! *debug-flag* (option-ref options 'debug #f))
+  (print-debug "debugging enabled~%")
+  (if (option-ref options 'help #f)
+    (display-help-and-exit EXIT_SUCCESS))
+  (if (option-ref options 'version #f)
+    (display-version-and-exit))
+  (let* ([db-path (option-ref options 'config "/var/lib/conf-service/conf-service.sqlite3")]
+	 [sock-path (option-ref options 'socket "/tmp/.conf-service-socket")]
+	 [db (open-db db-path)]
+	 [sock (open-socket sock-path)])
+    (dynamic-wind
+      (lambda () #f)
+      (lambda ()
+	(while (not done)
+	       (catch #t
+		      (lambda ()
+			(receive-message db sock))
+		      (lambda (key . args)
+			(if (not (eq? key 'quit))
+			  (print-debug "error receive-message: ~A ~A~%" key args))))))
+      (lambda ()
+	(close-socket sock sock-path)
+	(close-db db db-path)))))
+
